@@ -182,6 +182,7 @@ mem_init(void)
 	//      (ie. perm = PTE_U | PTE_P)
 	//    - pages itself -- kernel RW, user NONE
 	// Your code goes here:
+  boot_map_region(kern_pgdir, UPAGES, PTSIZE, PADDR(pages), PTE_U | PTE_P);
 
 	//////////////////////////////////////////////////////////////////////
 	// Use the physical memory that 'bootstack' refers to as the kernel
@@ -194,6 +195,8 @@ mem_init(void)
 	//       overwrite memory.  Known as a "guard page".
 	//     Permissions: kernel RW, user NONE
 	// Your code goes here:
+  boot_map_region(kern_pgdir, KSTACKTOP - KSTKSIZE, KSTKSIZE, PADDR(bootstack), PTE_W | PTE_P);
+
 
 	//////////////////////////////////////////////////////////////////////
 	// Map all of physical memory at KERNBASE.
@@ -203,6 +206,7 @@ mem_init(void)
 	// we just set up the mapping anyway.
 	// Permissions: kernel RW, user NONE
 	// Your code goes here:
+  boot_map_region(kern_pgdir, KERNBASE, -KERNBASE, 0, PTE_W | PTE_U);
 
 	// Check that the initial page directory has been set up correctly.
 	check_kern_pgdir();
@@ -273,7 +277,7 @@ page_init(void)
     } else if (i >= PGNUM(IOPHYSMEM) && i < PGNUM(EXTPHYSMEM)) {
       pages[i].pp_ref = 1;
       pages[i].pp_link = NULL;
-    } else if (i >= PGNUM(EXTPHYSMEM) && i < PGNUM(KERNBASE)) {
+    } else if (i >= PGNUM(EXTPHYSMEM) && i < PGNUM(boot_alloc(0) - KERNBASE)) {
       pages[i].pp_ref = 1;
       pages[i].pp_link = NULL;
     } else {
@@ -303,14 +307,13 @@ page_alloc(int alloc_flags)
     return NULL;
   }
 
-  struct PageInfo* pp = page_free_list;
+  struct PageInfo* page = page_free_list;
   page_free_list = page_free_list->pp_link;
-  pp->pp_ref = 0;
-  pp->pp_link = NULL;
+  page->pp_link = NULL;
   if (alloc_flags & ALLOC_ZERO) {
-    memset(page2kva(pp), 0, PGSIZE);
+    memset(page2kva(page), 0, PGSIZE);
   }
-  return pp;
+  return page;
 	// Fill this function in
 }
 
@@ -366,7 +369,25 @@ pte_t *
 pgdir_walk(pde_t *pgdir, const void *va, int create)
 {
 	// Fill this function in
-	return NULL;
+  uintptr_t page_directory_index = PDX(va);
+  uintptr_t page_table_index = PTX(va);
+
+  pde_t *page_directory_entry = pgdir + page_directory_index;
+  if (!(*page_directory_entry & PTE_P)) {
+    if (create == 0) {
+      return NULL;
+    }
+
+    struct PageInfo *page = page_alloc(1);
+    if (page == NULL) {
+      return NULL;
+    }
+    page->pp_ref += 1;
+    *page_directory_entry = page2pa(page) | PTE_P | PTE_W | PTE_U;
+  }
+
+  pte_t *page_table_entry = KADDR(PTE_ADDR(*page_directory_entry));
+  return page_table_entry + page_table_index;
 }
 
 //
@@ -383,6 +404,15 @@ pgdir_walk(pde_t *pgdir, const void *va, int create)
 static void
 boot_map_region(pde_t *pgdir, uintptr_t va, size_t size, physaddr_t pa, int perm)
 {
+  for (size_t offset=0; offset<size; offset+=PGSIZE, va+=PGSIZE, pa+=PGSIZE) {
+    pte_t *pte = pgdir_walk(pgdir, (void *)(va), 1);
+    if (pte == NULL) {
+      return;
+    }
+    cprintf("Virtual Address %x mapped to Physical Address %x\n", va, pa);
+
+    *pte = pa | perm | PTE_P;
+  }
 	// Fill this function in
 }
 
@@ -415,6 +445,16 @@ int
 page_insert(pde_t *pgdir, struct PageInfo *pp, void *va, int perm)
 {
 	// Fill this function in
+  pte_t *pte  = pgdir_walk(pgdir, va, 1);
+  if (!pte) {
+    return -E_NO_MEM;
+  }
+
+  pp->pp_ref++;
+  if (*pte & PTE_P) {
+    page_remove(pgdir, va);
+  }
+  *pte = page2pa(pp) | perm | PTE_P;
 	return 0;
 }
 
@@ -433,7 +473,15 @@ struct PageInfo *
 page_lookup(pde_t *pgdir, void *va, pte_t **pte_store)
 {
 	// Fill this function in
-	return NULL;
+  pte_t* pte = pgdir_walk(pgdir, va, 0);
+  if (pte == NULL || !(*pte & PTE_P)) {
+    return NULL;
+  }
+
+  if (pte_store != 0) {
+    *pte_store = pte;
+  }
+  return pa2page(PTE_ADDR(*pte));
 }
 
 //
@@ -454,6 +502,14 @@ page_lookup(pde_t *pgdir, void *va, pte_t **pte_store)
 void
 page_remove(pde_t *pgdir, void *va)
 {
+  pte_t *pte;
+  struct PageInfo *page = page_lookup(pgdir, va, &pte);
+  if (!page || !(*pte & PTE_P)) {
+    return; 
+  }
+  page_decref(page);
+  *pte = 0;
+  tlb_invalidate(pgdir, va);
 	// Fill this function in
 }
 
